@@ -21,6 +21,8 @@
 
 以及 **严格 FIFO 排队试算** 接口 `POST /queue-simulate`：桶与请求字段复用 `/simulate`，并为每个请求增加不早于 `timestamp` 的 `deadline`。请求按（到达时间, 输入顺序）排入**严格 FIFO 队列**，**仅队首可执行**；事件按队首各桶连续补充后的最早可执行时刻、下一次到达与 `deadline` 推进，等待期间到达的请求**不得越过队首**。队首在 `deadline` 前（含 `deadline` 时刻）余额充足即**原子扣减**放行；否则等待至 `deadline` 标记 `expired` 出队——成本超过容量或零补充不可达的队首同样等到 `deadline`——随后继续处理后继。响应按原始输入顺序给出 `executed` / `expired`、实际执行或过期时刻、等待秒数、限制桶与余额快照，并返回终态余额。
 
+以及 **半开滑动窗口试算** 接口 `POST /window-simulate`：给定多个带 `window_seconds` 与 `limit` 的滑动窗口策略（额度按 `principal` 归属主体相互隔离），以及按时间排序、携带 `principal` / `cost` / `policy_refs` 的请求序列。判定前先移除每个引用策略在**半开窗口** `(timestamp - window_seconds, timestamp]` **左端已过期**的记账事件，再统计窗口内该主体的累计消耗；仅当请求引用的**全部**策略都满足 `used + cost <= limit` 时才**原子记账**（向每个策略追加同一事件），否则**不改变任何策略**并返回 `policy_refs` 顺序上**首个超限策略**。响应按原始输入顺序给出 `allowed`、各引用策略的窗口边界、记账前后占用与剩余额度、拒绝原因明细，并返回各策略在最后请求时刻的**终态占用**（逐主体的事件数/占用/剩余）。
+
 ## 一条命令启动
 
 需要已安装 Docker（含 Compose 插件）。在本目录执行：
@@ -42,6 +44,7 @@ docker compose up --build
 | 预留试算接口 | http://localhost:8000/reservation-simulate （POST） |
 | 路由试算接口 | http://localhost:8000/route-simulate （POST） |
 | 排队试算接口 | http://localhost:8000/queue-simulate （POST） |
+| 滑动窗口试算接口 | http://localhost:8000/window-simulate （POST） |
 | Swagger 交互文档 | http://localhost:8000/docs |
 | ReDoc 文档 | http://localhost:8000/redoc |
 
@@ -770,6 +773,171 @@ docker compose up --build
 - r4：cost 5 超过 `api_qps` 容量 4，永远不可达，仍等待至 deadline t=4 才过期出队，不扣减；
 - r5：t=3 到达，等 r4 在 t=4 过期后成为队首，`api_qps` 补到 4 需等到 t=6 → 在 t=6 执行。
 
+## 请求格式 `POST /window-simulate`
+
+给定多个**半开滑动窗口**配额策略与一条带 `principal`（归属主体）的请求序列，按时间顺序做链上原子记账。与令牌桶不同，滑动窗口**没有补充概念**：额度随窗口左端滑动而自动释放。
+
+```json
+{
+  "policies": [
+    {"id": "per_second", "window_seconds": 1, "limit": 10},
+    {"id": "per_minute", "window_seconds": 60, "limit": 15}
+  ],
+  "requests": [
+    {"id": "r1", "timestamp": 0, "principal": "alpha", "cost": 6, "policy_refs": ["per_second", "per_minute"]},
+    {"id": "r2", "timestamp": 0, "principal": "alpha", "cost": 6, "policy_refs": ["per_second", "per_minute"]},
+    {"id": "r3", "timestamp": 1, "principal": "alpha", "cost": 6, "policy_refs": ["per_second", "per_minute"]},
+    {"id": "r4", "timestamp": 1, "principal": "alpha", "cost": 4, "policy_refs": ["per_minute"]},
+    {"id": "r5", "timestamp": 2, "principal": "beta", "cost": 9, "policy_refs": ["per_second"]}
+  ]
+}
+```
+
+### 字段说明
+
+**策略 `policies[]`**
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `id` | 是 | 窗口策略唯一标识，非空字符串 |
+| `window_seconds` | 是 | 滑动窗口宽度（秒），必须为正的有限数值 |
+| `limit` | 是 | 窗口内按主体统计的累计消耗上限，必须为正的有限数值 |
+
+**请求 `requests[]`**
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `id` | 是 | 请求唯一标识 |
+| `timestamp` | 是 | 请求时间（秒，任意一致的时间原点），可乱序输入，服务内部按时间排序 |
+| `principal` | 是 | 请求归属主体（租户/用户/调用方 ID），非空字符串；不同主体的窗口额度**相互独立** |
+| `cost` | 是 | 消耗量，必须 > 0；对每个引用策略各计此数量 |
+| `policy_refs` | 是 | 引用的策略 ID 列表（至少 1 个），同一请求内不可重复；按此顺序查找首个超限策略 |
+
+### 滑动窗口语义
+
+1. **半开窗口**：请求在时刻 `t` 判定时，窗口为 `(t - window_seconds, t]`——**右端含、左端不含**。恰好在左边界到期（事件时间 == `t - window_seconds`）的事件视为已过期被移除；恰好在右端（`t` 本身）的事件在窗口内。
+2. **判定前过期清理**：每次判定前，先从该策略该主体的事件列表左端弹出所有已过期事件，再对窗口内剩余事件的 `cost` 求和得到 `used_before`。
+3. **主体隔离**：每个 `(策略, principal)` 组合拥有独立的事件账本与独立的 `limit` 额度；一个主体用满不影响其他主体。
+4. **时间顺序**：请求按 `timestamp` 升序处理，同一时刻按输入数组顺序处理；`results` 仍按原始数组顺序返回（含 `index`）。
+5. **原子记账**：仅当请求引用的**全部**策略都满足 `used_before + cost <= limit` 时才放行，并一次性向每个引用策略的该主体账本追加 `(timestamp, cost)`；任一策略超限即拒绝，**所有策略保持不变**（连本次过期清理之外的状态都不新增），`rejected_by` 取 `policy_refs` 顺序上首个超限的策略，`rejection` 给出 `used` / `required` / `available` 等明细。
+6. **拒绝原因**：固定为 `limit_exceeded`；单笔 `cost > limit`（即使窗口为空）同样以超限拒绝而非 422。
+7. **剩余额度**：`remaining_before = limit - used_before`；放行时 `remaining_after = limit - used_before - cost`，拒绝时与 `remaining_before` 相同。
+8. **终态占用**：`policies[]` 以**最后一个请求的时间戳**为观察时刻，逐策略给出半开窗口边界、跨主体累计消耗 `total_used`，以及逐主体的窗口内有效事件数 `event_count`、`used` 与 `remaining`（按各主体首次成功记账的顺序；终态窗口内无有效事件的主体不输出）。
+
+### 响应示例
+
+```json
+{
+  "allowed_count": 3,
+  "rejected_count": 2,
+  "results": [
+    {
+      "request_id": "r1", "index": 0, "timestamp": 0.0, "principal": "alpha", "cost": 6.0,
+      "allowed": true, "rejected_by": null, "rejection": null,
+      "policies": {
+        "per_second": {
+          "id": "per_second", "window_seconds": 1.0, "limit": 10.0,
+          "window": {"start": -1.0, "end": 0.0},
+          "used_before": 0.0, "used_after": 6.0,
+          "remaining_before": 10.0, "remaining_after": 4.0
+        },
+        "per_minute": {
+          "id": "per_minute", "window_seconds": 60.0, "limit": 15.0,
+          "window": {"start": -60.0, "end": 0.0},
+          "used_before": 0.0, "used_after": 6.0,
+          "remaining_before": 15.0, "remaining_after": 9.0
+        }
+      }
+    },
+    {
+      "request_id": "r2", "index": 1, "timestamp": 0.0, "principal": "alpha", "cost": 6.0,
+      "allowed": false, "rejected_by": "per_second",
+      "rejection": {
+        "policy_id": "per_second", "reason": "limit_exceeded",
+        "window_seconds": 1.0, "limit": 10.0,
+        "used": 6.0, "cost": 6.0, "required": 12.0, "available": 4.0,
+        "window": {"start": -1.0, "end": 0.0}
+      },
+      "policies": {
+        "per_second": {"id": "per_second", "window_seconds": 1.0, "limit": 10.0,
+          "window": {"start": -1.0, "end": 0.0},
+          "used_before": 6.0, "used_after": 6.0,
+          "remaining_before": 4.0, "remaining_after": 4.0},
+        "per_minute": {"id": "per_minute", "window_seconds": 60.0, "limit": 15.0,
+          "window": {"start": -60.0, "end": 0.0},
+          "used_before": 6.0, "used_after": 6.0,
+          "remaining_before": 9.0, "remaining_after": 9.0}
+      }
+    },
+    {
+      "request_id": "r3", "index": 2, "timestamp": 1.0, "principal": "alpha", "cost": 6.0,
+      "allowed": true, "rejected_by": null, "rejection": null,
+      "policies": {
+        "per_second": {"id": "per_second", "window_seconds": 1.0, "limit": 10.0,
+          "window": {"start": 0.0, "end": 1.0},
+          "used_before": 0.0, "used_after": 6.0,
+          "remaining_before": 10.0, "remaining_after": 4.0},
+        "per_minute": {"id": "per_minute", "window_seconds": 60.0, "limit": 15.0,
+          "window": {"start": -59.0, "end": 1.0},
+          "used_before": 6.0, "used_after": 12.0,
+          "remaining_before": 9.0, "remaining_after": 3.0}
+      }
+    },
+    {
+      "request_id": "r4", "index": 3, "timestamp": 1.0, "principal": "alpha", "cost": 4.0,
+      "allowed": false, "rejected_by": "per_minute",
+      "rejection": {
+        "policy_id": "per_minute", "reason": "limit_exceeded",
+        "window_seconds": 60.0, "limit": 15.0,
+        "used": 12.0, "cost": 4.0, "required": 16.0, "available": 3.0,
+        "window": {"start": -59.0, "end": 1.0}
+      },
+      "policies": {
+        "per_minute": {"id": "per_minute", "window_seconds": 60.0, "limit": 15.0,
+          "window": {"start": -59.0, "end": 1.0},
+          "used_before": 12.0, "used_after": 12.0,
+          "remaining_before": 3.0, "remaining_after": 3.0}
+      }
+    },
+    {
+      "request_id": "r5", "index": 4, "timestamp": 2.0, "principal": "beta", "cost": 9.0,
+      "allowed": true, "rejected_by": null, "rejection": null,
+      "policies": {
+        "per_second": {"id": "per_second", "window_seconds": 1.0, "limit": 10.0,
+          "window": {"start": 1.0, "end": 2.0},
+          "used_before": 0.0, "used_after": 9.0,
+          "remaining_before": 10.0, "remaining_after": 1.0}
+      }
+    }
+  ],
+  "policies": [
+    {
+      "id": "per_second", "window_seconds": 1.0, "limit": 10.0, "total_used": 9.0,
+      "window": {"start": 1.0, "end": 2.0},
+      "principals": [
+        {"principal": "beta", "event_count": 1, "used": 9.0, "remaining": 1.0,
+         "window": {"start": 1.0, "end": 2.0}}
+      ]
+    },
+    {
+      "id": "per_minute", "window_seconds": 60.0, "limit": 15.0, "total_used": 12.0,
+      "window": {"start": -58.0, "end": 2.0},
+      "principals": [
+        {"principal": "alpha", "event_count": 2, "used": 12.0, "remaining": 3.0,
+         "window": {"start": -58.0, "end": 2.0}}
+      ]
+    }
+  ]
+}
+```
+
+- r1：两策略窗口均空，6 ≤ 10 且 6 ≤ 15 → 原子记账；
+- r2：同刻 alpha 在两策略窗口内各有 6，`6 + 6 = 12 > 10` 先撞 `per_second` → 原子拒绝，`per_minute` 也保持 6；
+- r3：t=1 时 `per_second` 窗口为 `(0,1]`，t=0 的事件恰在左边界已过期（used 0，放行）；`per_minute` 窗口仍含该事件（used 6，6+6=12 ≤ 15，放行）；
+- r4：仅引用 `per_minute`，used 12 + 4 = 16 > 15 → 拒绝；
+- r5：beta 是独立主体，`per_second` 上拥有自己的满额度 10，cost 9 放行；
+- 终态观察时刻 t=2：`per_second` 窗口 `(1,2]` 内只剩 beta 的 9（alpha t=1 的事件在左边界过期）；`per_minute` 窗口 `(-58,2]` 内 alpha 两笔共 12。
+
 ## 校验规则（HTTP 422）
 
 以下非法输入都会被拒绝，错误体统一为 `{"detail": [ {"type", "loc", "msg", ...}, ... ]}`：
@@ -782,9 +950,10 @@ docker compose up --build
 - **非法预留区间**：`start` / `end` 非有限数值，或 `end <= start`（仅 `/reservation-simulate`）；
 - **非法候选链**（仅 `/route-simulate`）：`chains` 为空、候选链为空、候选链内桶重复；候选链引用未定义的桶同样报 `unknown_bucket_ref`（`loc` 定位到具体候选链）；
 - **非法 deadline**（仅 `/queue-simulate`）：`deadline` 缺失、非有限数值或早于 `timestamp`；
+- **非法滑动窗口策略/请求**（仅 `/window-simulate`）：`policies[].id` 重复（`duplicate_policy`）；`window_seconds` / `limit` 缺失、非有限数值或 `<= 0`；`policy_refs` 引用未定义策略（`unknown_policy_ref`）、为空或在同一请求内重复；`principal` 缺失或不是非空字符串；请求 ID 重复（`duplicate_request`）；
 - 此外还校验：链为空、链内桶重复、`cost <= 0`、请求 ID 重复（`duplicate_request`，仅 `/simulate` 系接口、`/route-simulate` 与 `/queue-simulate`）、多余字段（`extra="forbid"`）。
 
-以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances`、`/usage-report`、`/fairness-report`、`/reservation-simulate`、`/route-simulate` 与 `/queue-simulate` 同时生效（按各自字段；`/plan-initial-balances`、`/usage-report` 与 `/fairness-report` 复用 `/simulate` 的桶与请求跨字段校验；`/reservation-simulate` 使用独立的容量桶模型；`/route-simulate` 复用 `/simulate` 的桶模型并对每条候选链做引用校验；`/queue-simulate` 复用 `/simulate` 的桶、请求字段与跨字段校验，并在请求上增加 `deadline` 校验）。
+以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances`、`/usage-report`、`/fairness-report`、`/reservation-simulate`、`/route-simulate`、`/queue-simulate` 与 `/window-simulate` 同时生效（按各自字段；`/plan-initial-balances`、`/usage-report` 与 `/fairness-report` 复用 `/simulate` 的桶与请求跨字段校验；`/reservation-simulate` 使用独立的容量桶模型；`/route-simulate` 复用 `/simulate` 的桶模型并对每条候选链做引用校验；`/queue-simulate` 复用 `/simulate` 的桶、请求字段与跨字段校验，并在请求上增加 `deadline` 校验；`/window-simulate` 使用独立的滑动窗口策略模型，按主体记账并对 `policy_refs` 做引用校验）。
 
 ## 本地调用示例
 
@@ -820,6 +989,10 @@ curl -X POST http://localhost:8000/route-simulate \
 curl -X POST http://localhost:8000/queue-simulate \
   -H 'Content-Type: application/json' \
   -d @examples/queue-simulate.json
+
+curl -X POST http://localhost:8000/window-simulate \
+  -H 'Content-Type: application/json' \
+  -d @examples/window-simulate.json
 ```
 
 ## 不使用 Docker 的本地开发（可选）
@@ -851,6 +1024,7 @@ pytest -q
 │   ├── reservation.py   # 区间预留试算引擎（容量受限的链上原子预留）
 │   ├── routing.py       # 候选链路由试算引擎（多候选链选路 + 原子扣减）
 │   ├── queueing.py      # 严格 FIFO 排队试算引擎（队首等待至可执行时刻或 deadline）
+│   ├── windowing.py     # 半开滑动窗口试算引擎（多策略/多主体链上原子记账）
 │   └── errors.py        # 跨字段校验错误类型
 ├── tests/               # pytest 测试（引擎语义 + HTTP）
 ├── examples/request.json
@@ -861,6 +1035,7 @@ pytest -q
 ├── examples/reservation-simulate.json
 ├── examples/route-simulate.json
 ├── examples/queue-simulate.json
+├── examples/window-simulate.json
 ├── requirements.txt
 ├── Dockerfile           # 依赖安装在镜像构建阶段完成
 ├── docker-compose.yml   # 单命令启动，映射 8000 端口

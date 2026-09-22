@@ -25,6 +25,8 @@ from app.models import (
     SimulateResponse,
     UsageReportRequest,
     UsageReportResponse,
+    WindowSimulateRequest,
+    WindowSimulateResponse,
 )
 from app.planner import plan_initial_balances
 from app.queueing import queue_simulate
@@ -32,6 +34,7 @@ from app.reservation import reservation_simulate
 from app.routing import route_simulate
 from app.simulation import simulate
 from app.usage import usage_report
+from app.windowing import window_simulate
 
 app = FastAPI(
     title="多层配额原子试算 API",
@@ -53,6 +56,11 @@ app = FastAPI(
         "仅队首可执行；以队首各桶连续补充后的最早可执行时刻、下一次到达与 deadline "
         "推进事件，deadline 前（含）余额充足即原子扣减放行，否则等待至 deadline 标记 "
         "expired 后继续处理后继（成本超过容量或零补充不可达的队首同样等到 deadline）。"
+        "以及 /window-simulate：给定多个带 window_seconds 与 limit 的半开滑动窗口策略"
+        "（额度按 principal 隔离）与按时间排序、携带 principal/cost/policy_refs 的请求，"
+        "判定前移除各策略窗口左端已过期事件，仅当请求引用的全部策略在窗口内累计消耗"
+        "加 cost 均不超过 limit 时原子记账，否则不改变任何策略并返回引用顺序上首个超限策略；"
+        "响应按原始顺序给出 allowed、窗口边界、剩余额度、拒绝原因与各策略终态占用。"
     ),
     version="1.0.0",
 )
@@ -83,6 +91,7 @@ def root():
         "reservation_simulate": "/reservation-simulate",
         "route_simulate": "/route-simulate",
         "queue_simulate": "/queue-simulate",
+        "window_simulate": "/window-simulate",
     }
 
 
@@ -143,3 +152,12 @@ def route_simulate_endpoint(payload: RouteSimulateRequest) -> RouteSimulateRespo
 )
 def queue_simulate_endpoint(payload: QueueSimulateRequest) -> QueueSimulateResponse:
     return queue_simulate(payload)
+
+
+@app.post(
+    "/window-simulate",
+    response_model=WindowSimulateResponse,
+    tags=["window"],
+)
+def window_simulate_endpoint(payload: WindowSimulateRequest) -> WindowSimulateResponse:
+    return window_simulate(payload)
