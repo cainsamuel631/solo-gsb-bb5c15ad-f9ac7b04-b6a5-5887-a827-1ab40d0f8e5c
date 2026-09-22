@@ -1096,3 +1096,209 @@ class QueueSimulateResponse(BaseModel):
     final_balances: Annotated[
         dict[str, float], Field(description="最后一个请求出队时刻所有桶的余额")
     ]
+
+
+class WindowPolicySpec(BaseModel):
+    """半开滑动窗口配额策略。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: Annotated[str, Field(min_length=1, description="策略唯一标识")]
+    window_seconds: Annotated[float, Field(description="滑动窗口宽度（秒），必须为正数")]
+    limit: Annotated[float, Field(description="窗口内累计消耗上限，必须为正数")]
+
+    @field_validator("window_seconds", "limit", mode="before")
+    @classmethod
+    def _validate_positive_finite(cls, value, info):
+        if not _is_finite_number(value):
+            raise ValueError(f"{info.field_name} 必须是有限数值")
+        if value <= 0:
+            raise ValueError(f"{info.field_name} 必须为正数")
+        return value
+
+
+class WindowSimRequest(BaseModel):
+    """单次滑动窗口试算请求，按 policy_chain 引用多个策略。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: Annotated[str, Field(min_length=1, description="请求唯一标识")]
+    timestamp: Annotated[float, Field(description="请求时间（秒，任意一致的时间原点）")]
+    principal: Annotated[
+        str, Field(min_length=1, description="请求归属主体（租户/用户/调用方 ID）")
+    ]
+    cost: Annotated[float, Field(gt=0, description="本次请求对链上每个策略产生的消耗量")]
+    policy_chain: Annotated[list[str], Field(min_length=1, description="引用的策略 ID 列表")]
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def _validate_timestamp(cls, value):
+        if not _is_finite_number(value):
+            raise ValueError("timestamp 必须是有限数值")
+        return value
+
+    @field_validator("cost", mode="before")
+    @classmethod
+    def _validate_cost(cls, value):
+        if not _is_finite_number(value):
+            raise ValueError("cost 必须是有限数值")
+        if value <= 0:
+            raise ValueError("cost 必须为正数")
+        return value
+
+    @field_validator("principal", mode="before")
+    @classmethod
+    def _validate_principal(cls, value):
+        if not isinstance(value, str) or not value:
+            raise ValueError("principal 必须是非空字符串")
+        return value
+
+    @field_validator("policy_chain")
+    @classmethod
+    def _validate_policy_chain_shape(cls, value: list[str]):
+        if not value:
+            raise ValueError("policy_chain 至少需要引用一个策略")
+        seen: set[str] = set()
+        for policy_id in value:
+            if not isinstance(policy_id, str) or not policy_id:
+                raise ValueError("policy_chain 中的策略 ID 必须是非空字符串")
+            if policy_id in seen:
+                raise ValueError(f"policy_chain 中存在重复策略引用: {policy_id}")
+            seen.add(policy_id)
+        return value
+
+
+class WindowSimulateRequest(BaseModel):
+    """POST /window-simulate 请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    policies: Annotated[list[WindowPolicySpec], Field(min_length=1, description="滑动窗口策略集合")]
+    requests: Annotated[
+        list[WindowSimRequest], Field(min_length=1, description="按时间戳试算的请求序列")
+    ]
+
+    @model_validator(mode="after")
+    def _cross_validate(self):
+        errors: list[dict] = []
+
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for index, policy in enumerate(self.policies):
+            if policy.id in seen:
+                duplicates.add(policy.id)
+                errors.append(
+                    {
+                        "type": "duplicate_policy",
+                        "loc": ("policies", index, "id"),
+                        "msg": f"重复的策略 ID: {policy.id}",
+                        "input": policy.id,
+                    }
+                )
+            seen.add(policy.id)
+
+        if duplicates:
+            raise RequestValidationErrors(errors)
+
+        for r_index, request in enumerate(self.requests):
+            for p_index, policy_id in enumerate(request.policy_chain):
+                if policy_id not in seen:
+                    errors.append(
+                        {
+                            "type": "unknown_policy_ref",
+                            "loc": ("requests", r_index, "policy_chain", p_index),
+                            "msg": f"请求 {request.id!r} 引用了未定义的策略: {policy_id}",
+                            "input": policy_id,
+                        }
+                    )
+
+        seen_req: set[str] = set()
+        for r_index, request in enumerate(self.requests):
+            if request.id in seen_req:
+                errors.append(
+                    {
+                        "type": "duplicate_request",
+                        "loc": ("requests", r_index, "id"),
+                        "msg": f"重复的请求 ID: {request.id}",
+                        "input": request.id,
+                    }
+                )
+            seen_req.add(request.id)
+
+        if errors:
+            raise RequestValidationErrors(errors)
+        return self
+
+
+class WindowPolicyDecision(BaseModel):
+    """单个请求对其引用链上某个策略的窗口判定视图。"""
+
+    policy_id: str
+    principal: str
+    window_start: Annotated[float, Field(description="窗口左端（不含）= timestamp - window_seconds")]
+    window_end: Annotated[float, Field(description="窗口右端（含）= timestamp")]
+    limit: float
+    used_before: Annotated[float, Field(description="过期事件移除后、记账前的窗口占用")]
+    used_after: Annotated[
+        float, Field(description="记账后的窗口占用；请求被拒时与 used_before 相同")
+    ]
+    remaining_before: Annotated[float, Field(description="记账前剩余额度")]
+    remaining_after: Annotated[
+        float, Field(description="记账后剩余额度；请求被拒时与 remaining_before 相同")
+    ]
+
+
+class WindowSimResult(BaseModel):
+    """单项滑动窗口请求的试算结果。"""
+
+    request_id: str
+    index: Annotated[int, Field(description="该请求在原始 requests 数组中的下标")]
+    timestamp: float
+    principal: str
+    cost: float
+    allowed: bool
+    rejected_by: Annotated[
+        str | None, Field(default=None, description="导致拒绝的第一个超限策略 ID；放行时为 null")
+    ] = None
+    reason: Annotated[
+        Literal["cost_exceeds_limit", "window_limit_exceeded"] | None,
+        Field(default=None, description="拒绝原因；放行时为 null"),
+    ] = None
+    policy_decisions: Annotated[
+        list[WindowPolicyDecision], Field(description="各引用策略的窗口与额度视图，按引用顺序")
+    ]
+
+
+class WindowPrincipalState(BaseModel):
+    """单个主体在某个策略终态窗口内的占用。"""
+
+    principal: str
+    used: Annotated[float, Field(description="终态窗口内已接受请求的消耗合计")]
+    remaining: Annotated[float, Field(description="终态窗口剩余额度")]
+    event_count: Annotated[int, Field(description="终态窗口内仍有效的已接受事件数")]
+
+
+class WindowPolicyFinalState(BaseModel):
+    """单个滑动窗口策略在最后请求时刻的终态。"""
+
+    policy_id: str
+    window_seconds: float
+    limit: float
+    window_start: Annotated[float, Field(description="终态窗口左端（不含）")]
+    window_end: Annotated[float, Field(description="终态窗口右端（含），即最后请求时间戳")]
+    principals: Annotated[
+        list[WindowPrincipalState],
+        Field(description="引用过该策略的各主体终态占用，按首次引用顺序"),
+    ]
+
+
+class WindowSimulateResponse(BaseModel):
+    allowed_count: int
+    rejected_count: int
+    results: Annotated[
+        list[WindowSimResult], Field(description="逐项请求结果，按原始输入索引升序")
+    ]
+    final_timestamp: Annotated[float, Field(description="终态窗口右端（最后请求时间戳）")]
+    final_states: Annotated[
+        list[WindowPolicyFinalState], Field(description="各策略终态占用，按 policies 输入顺序")
+    ]

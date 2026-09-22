@@ -1,0 +1,36 @@
+{
+  "policies": [
+    {"id": "burst_10s", "window_seconds": 10, "limit": 5},
+    {"id": "minute_60s", "window_seconds": 60, "limit": 8}
+  ],
+  "requests": [
+    {
+      "id": "r1",
+      "timestamp": 0,
+      "principal": "tenant-a",
+      "cost": 4,
+      "policy_chain": ["burst_10s", "minute_60s"]
+    },
+    {
+      "id": "r2",
+      "timestamp": 1,
+      "principal": "tenant-a",
+      "cost": 2,
+      "policy_chain": ["burst_10s", "minute_60s"]
+    },
+    {
+      "id": "r3",
+      "timestamp": 1,
+      "principal": "tenant-b",
+      "cost": 5,
+      "policy_chain": ["burst_10s"]
+    },
+    {
+      "id": "r4",
+      "timestamp": 10,
+      "principal": "tenant-a",
+      "cost": 1,
+      "policy_chain": ["burst_10s"]
+    }
+  ]
+}
